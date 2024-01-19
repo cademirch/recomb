@@ -1,0 +1,158 @@
+import pandas as pd
+from pathlib import Path
+from yaml import safe_load
+
+configfile: "config/config.yaml"
+with open(config["resource_config"], "r") as f:
+    resource_config = safe_load(f)
+
+AWK_SCRIPT_FOR_PAIR_FIXING = (
+    "/private/groups/russelllab/cade/wolb-mix/recomb/workflow/scripts/fix_pairs.awk"
+)
+
+samples = pd.read_table(config["sample_sheet"], sep=",", dtype=str).replace(
+    " ", "_", regex=True
+)
+
+
+rule all:
+    input:
+        expand("results/mappability_{e_val}/map.bed", e_val=range(5)),
+        expand("recomb_results/{e_val}/coverages_recomb.csv", e_val=range(5)),
+        expand(
+            "recomb_results/{e_val}/bambed/{samp}.bed",
+            samp=samples["sample_id"].tolist(),
+            e_val=range(5)
+        ),
+        expand(
+            "recomb_results/{e_val}/depths/{samp}.mosdepth.summary.txt",
+            samp=samples["sample_id"].tolist(),
+            e_val=range(5)
+        ),
+
+rule mappability:
+    input:
+        config["genome_path"],
+    output:
+        bedgraph=temp(
+            f"results/mappability_{{e_val}}/{Path(config['genome_path']).stem}.genmap.bedgraph"
+        ),
+        sorted_bedgraph="results/mappability_{e_val}/sorted.bg",
+        min_bed="results/mappability_{e_val}/map.bed",
+        out_dir=directory("results/mappability_{e_val}"),
+    log:
+        "logs/mappability_{e_val}/log.txt",
+    params:
+        k=config["mappability"]["kmer_size"],
+        e="{e_val}",
+        cutoff=config["mappability"]["score_cutoff"],
+        index_dir="results/mappability/index",
+    conda:
+        "envs/env.yaml"
+    threads: resource_config["mappability"]["threads"]
+    resources:
+        mem_mb=resource_config["mappability"]["mem_mb"],
+        runtime=resource_config["mappability"]["runtime"],
+    shell:
+        """
+        genmap map -K {params.k} -E {params.e} -I {params.index_dir} -O {output.out_dir} \
+            -bg -T {threads} -v &>> {log}
+        sort -k1,1 -k2,2n {output.bedgraph} > {output.sorted_bedgraph} 2>> {log}
+        awk 'BEGIN{{OFS="\\t";FS="\\t"}} {{ if($4>={params.cutoff}) print $1,$2,$3 }}' \
+            {output.sorted_bedgraph} > {output.min_bed}
+        """
+
+
+
+rule find_chimeras:
+    input:
+        "results/bams/dedup/{samp}.bam",
+    output:
+        "recomb_results/{e_val}/chimeras/{samp}.bam",
+    conda:
+        "envs/env.yaml"
+    script:
+        "scripts/find_recomb.py"
+
+
+rule view_mappability:
+    input:
+        bam="recomb_results/{e_val}/chimeras/{samp}.bam",
+        mappability="results/mappability_{e_val}/map.bed",
+    output:
+        filtered="recomb_results/{e_val}/chimeras_filtered/{samp}.bam",
+        # filtered_index="recomb_results/chimeras_filtered/{samp}.bam.bai",
+    conda:
+        "envs/env.yaml"
+    shell:
+        """
+        samtools index {input.bam}
+        samtools view -h --region-file {input.mappability} {input.bam} | grep -v -e 'XA:Z:' -e 'SA:Z:' | samtools view -bh - |
+        samtools sort -n - > {output.filtered}
+        # samtools index {output.filtered}
+        """
+
+
+rule get_rid_of_unpaired:
+    input:
+        bam="recomb_results/{e_val}/chimeras_filtered/{samp}.bam",
+    output:
+        bam="recomb_results/{e_val}/best_chimeras/{samp}.bam",
+        bai="recomb_results/{e_val}/best_chimeras/{samp}.bam.bai",
+        stats="recomb_results/{e_val}/best_chimeras/{samp}_algnstats.txt",
+    conda:
+        "envs/env.yaml"
+    shell:
+        """
+        samtools fixmate -u {input.bam} - | samtools view -b -e 'flag.paired' - |
+        samtools sort -@ 5 -O BAM -o {output.bam} - ; samtools index -@ 5 {output.bam}
+        samtools flagstat -O tsv {output.bam} > {output.stats}
+        """
+
+
+rule bamtobed:
+    input:
+        bam="recomb_results/{e_val}/best_chimeras/{samp}.bam",
+        bai="recomb_results/{e_val}/best_chimeras/{samp}.bam.bai",
+    output:
+        bed="recomb_results/{e_val}/bambed/{samp}.bed",
+    shell:
+        "samtools sort -n {input.bam} | bedtools bamtobed -i stdin -bedpe > {output.bed}"
+
+
+rule depth:
+    input:
+        bam="recomb_results/{e_val}/best_chimeras/{samp}.bam",
+        bai="recomb_results/{e_val}/best_chimeras/{samp}.bam.bai",
+        mappability="results/mappability_{e_val}/map.bed",
+    output:
+        summary="recomb_results/{e_val}/depths/{samp}.mosdepth.summary.txt",
+    params:
+        prefix=lambda wc, output: output[0].replace(".mosdepth.summary.txt", ""),
+    shell:
+        "mosdepth --by {input.mappability} -F 1024 {params.prefix} {input.bam}"
+
+
+rule read_stats:
+    input:
+        csv="results/coverages.csv",
+        stats=expand(
+            "recomb_results/{{e_val}}/best_chimeras/{samp}_algnstats.txt",
+            samp=samples["sample_id"].tolist()
+        ),
+    output:
+        "recomb_results/{e_val}/coverages_recomb.csv",
+    run:
+        df = pd.read_csv(input.csv)
+        for file in input.stats:
+            file = Path(file)
+            samp_id = file.name.replace("_algnstats.txt", "")
+            total_reads = 0
+            with open(file, "r") as f:
+                lines = f.readlines()
+                for line in lines:
+                    if "total" in line:
+                        total_reads = int(line.split()[0])
+                        break
+            df.loc[df["sample_id"] == samp_id, "recomb_reads"] = total_reads
+        df.to_csv(output[0], sep=",", index=False)
